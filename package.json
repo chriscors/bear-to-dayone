@@ -1,28 +1,28 @@
 {
-  "name": "backup-bear-notes",
-  "version": "1.0.4",
-  "description": "Back up your Bear Notes content to a folder",
+  "name": "bear-to-dayone",
+  "version": "1.0.0",
+  "description": "Export your Bear Notes content to Day One",
   "bin": "index.js",
   "scripts": {
     "test": "node test.js"
   },
   "repository": {
     "type": "git",
-    "url": "https://github.com/TehShrike/backup-bear-notes.git"
+    "url": "https://github.com/ChrsCors/bear-to-dayone.git"
   },
   "keywords": [
+    "dayone",
     "bear",
     "notes",
-    "app",
-    "backup"
+    "export"
   ],
-  "author": "TehShrike",
+  "author": "ChrsCors",
   "license": "WTFPL",
   "dependencies": {
+    "better-sqlite3": "^12.2.0",
     "make-dir": "1.3.0",
     "mri": "^1.1.4",
     "pify": "4.0.1",
-    "sqlite": "3.0.0",
     "untildify": "3.0.3"
   }
 }

@@ -1,76 +1,126 @@
 #!/usr/bin/env node
 
-const untildify = require(`untildify`)
-const buildFilename = require(`./build-filename`)
-const mri = require('mri')
-
-const { 'use-tags-as-directories': useTagsAsDirectories } = mri(process.argv.slice(2))
+const untildify = require('untildify');
+const path = require('path');
+const fs = require('fs');
+const crypto = require('crypto');
+const Database = require('better-sqlite3');
 
 const BEAR_DB = untildify(
-	`~/Library/Group Containers/9K33E3U3T4.net.shinyfrog.bear/Application Data/database.sqlite`
-)
+  '~/Library/Group Containers/9K33E3U3T4.net.shinyfrog.bear/Application Data/database.sqlite'
+);
+const BEAR_IMAGES = untildify(
+  '~/Library/Group Containers/9K33E3U3T4.net.shinyfrog.bear/Application Data/Local Files/Note Images/'
+);
 
-const [ ,, outputDirectory ] = process.argv
-
+const [,, outputDirectory] = process.argv;
 if (!outputDirectory) {
-	process.stderr.write(`You must provide an output directory\n`)
-	process.exit(1)
+  process.stderr.write('You must provide an output directory\n');
+  process.exit(1);
 }
 
-main(
-	untildify(outputDirectory)
-).then(writeFileResults => {
-	console.log(`Backed up ${ writeFileResults.length } notes.`)
-}).catch(err => {
-	process.nextTick(() => {
-		throw err
-	})
-})
+function bearDateToISO(bearDate) {
+  if (!bearDate) return '';
+  const macEpoch = new Date('2001-01-01T00:00:00Z').getTime();
+  const ms = macEpoch + (parseFloat(bearDate) * 1000);
+  return new Date(ms).toISOString();
+}
+
+function md5FileSync(filePath) {
+  const data = fs.readFileSync(filePath);
+  return crypto.createHash('md5').update(data).digest('hex');
+}
+
+function ensureDirSync(dir) {
+  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+}
+
+main(untildify(outputDirectory))
+  .then(count => {
+    console.log(`Exported ${count} notes to Day One JSON.`);
+  })
+  .catch(err => {
+    process.nextTick(() => {
+      throw err;
+    });
+  });
 
 async function main(outputDirectory) {
-	const path = require(`path`)
-	const sqlite = require(`sqlite`)
-	const makeDir = require(`make-dir`)
-	const pify = require(`pify`)
-	const fs = pify(require(`fs`))
+  ensureDirSync(outputDirectory);
+  const photosDir = path.join(outputDirectory, 'photos');
+  ensureDirSync(photosDir);
+  const db = new Database(BEAR_DB, { readonly: true });
 
-	await makeDir(outputDirectory)
+  // Map Z_PK to ZUNIQUEIDENTIFIER for notes
+  const noteIdToUUID = {};
+  db.prepare('SELECT Z_PK, ZUNIQUEIDENTIFIER FROM ZSFNOTE').all().forEach(row => {
+    noteIdToUUID[row.Z_PK] = row.ZUNIQUEIDENTIFIER;
+  });
 
-	const db = await sqlite.open(BEAR_DB)
+  // Get all image files
+  const imageFiles = db.prepare('SELECT Z_PK, ZNOTE, ZFILENAME, ZUNIQUEIDENTIFIER FROM ZSFNOTEFILE').all();
+  // Map: note PK -> [{filename, uuid}]
+  const noteImages = {};
+  imageFiles.forEach(img => {
+    if (!noteImages[img.ZNOTE]) noteImages[img.ZNOTE] = [];
+    noteImages[img.ZNOTE].push({ filename: img.ZFILENAME, uuid: img.ZUNIQUEIDENTIFIER });
+  });
 
-	const rows = await db.all(`
-		SELECT
-			ZSFNOTE.ZTITLE AS title,
-			ZSFNOTE.ZTEXT AS text,
-			ZSFNOTETAG.ZTITLE AS tag,
-			ZSFNOTE.ZTRASHED AS trashed
-		FROM
-			ZSFNOTE
-		LEFT JOIN Z_7TAGS ON ZSFNOTE.Z_PK = Z_7TAGS.Z_7NOTES
-		LEFT JOIN ZSFNOTETAG ON Z_7TAGS.Z_14TAGS = ZSFNOTETAG.Z_PK
-		ORDER BY LENGTH(tag)`)
+  // Get all notes
+  const notes = db.prepare(`
+    SELECT Z_PK, ZTITLE, ZTEXT, ZUNIQUEIDENTIFIER, ZCREATIONDATE, ZMODIFICATIONDATE, ZPINNED
+    FROM ZSFNOTE
+    WHERE ZTRASHED = 0
+  `).all();
 
-	if (useTagsAsDirectories) {
-		const tags = Array.from(new Set(rows.map(row => row.tag)))
+  const entries = [];
+  for (const note of notes) {
+    let text = note.ZTEXT || '';
+    const images = (noteImages[note.Z_PK] || []);
+    const photos = [];
+    // Replace Bear image markdown with Day One style and collect photo info
+    for (const img of images) {
+      const imgDir = path.join(BEAR_IMAGES, img.uuid);
+      if (!fs.existsSync(imgDir)) continue;
+      const files = fs.readdirSync(imgDir).filter(f => !f.startsWith('.'));
+      if (files.length === 0) continue;
+      const file = files[0];
+      const ext = path.extname(file).replace('.', '').toLowerCase();
+      const filePath = path.join(imgDir, file);
+      const md5 = md5FileSync(filePath);
+      const destFile = path.join(photosDir, md5 + '.' + ext);
+      if (!fs.existsSync(destFile)) {
+        fs.copyFileSync(filePath, destFile);
+      }
+      // Add photo object
+      photos.push({
+        identifier: img.uuid,
+        md5,
+        type: ext
+      });
+      // Replace Bear markdown with Day One reference
+      // Replace all possible markdowns for this image
+      const bearMdRegex = new RegExp(`!\\[\\]\\((?:${img.filename.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')})\\)`, 'g');
+      text = text.replace(bearMdRegex, `![](dayone-moment://${img.uuid})`);
+    }
+    // Remove any leftover Bear image markdown
+    text = text.replace(/!\[\]\([^\)]+\.(png|jpg|jpeg|gif|heic|webp)\)/gi, '').replace(/\n{3,}/g, '\n\n').trim();
+    entries.push({
+      text,
+      creationDate: bearDateToISO(note.ZCREATIONDATE),
+      modifiedDate: bearDateToISO(note.ZMODIFICATIONDATE),
+      uuid: note.ZUNIQUEIDENTIFIER,
+      starred: false,
+      isPinned: !!note.ZPINNED,
+      editingTime: 0,
+      photos
+    });
+  }
 
-		await Promise.all(tags.map(tag => {
-			const tagDirectory = tag ? tag : 'untagged'
-
-			return makeDir(path.join(outputDirectory, tagDirectory))
-		}))
-	}
-
-	return Promise.all(
-		rows.map(({ title, text, tag, trashed }) => {
-			const filename = buildFilename(title)
-			const destinationDirectory = !useTagsAsDirectories ?
-				outputDirectory : path.join(outputDirectory, tag || `untagged`)
-
-			if (trashed) {
-				return fs.unlink(path.join(destinationDirectory, filename))
-			}
-
-			return fs.writeFile(path.join(destinationDirectory, filename), text, { encoding: `utf8` })
-		})
-	)
-}
+  const journal = {
+    metadata: { version: '1.0' },
+    entries
+  };
+  fs.writeFileSync(path.join(outputDirectory, 'Journal.json'), JSON.stringify(journal, null, 2), 'utf8');
+  return entries.length;
+} 
